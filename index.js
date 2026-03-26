@@ -1,35 +1,42 @@
-require('dotenv').config();
-const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
+import { Hono } from 'hono';
 
-const app = express();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const app = new Hono();
 
-// 1x1 transparent GIF in binary
-const PIXEL = Buffer.from(
-  'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
-  'base64'
-);
+const PIXEL = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
-app.get('/track/:personId/:emailId', async (req, res) => {
-  const { personId, emailId } = req.params;
+app.get('/track/:personId/:emailId', async (c) => {
+  const personId = c.req.param('personId');
+  const emailId = c.req.param('emailId');
 
-  // Log to Supabase (don't await — serve pixel immediately, log in background)
-  supabase.from('opens').insert({
-    person_id: personId,
-    email_id: emailId,
-    ip: req.headers['x-forwarded-for'] || req.ip,
-    user_agent: req.headers['user-agent']
-  }).then(() => console.log(`Tracked: ${personId} / ${emailId}`));
+  // Log to Supabase in background
+  c.executionCtx.waitUntil(
+    fetch(`${c.env.SUPABASE_URL}/rest/v1/opens`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': c.env.SUPABASE_KEY,
+        'Authorization': `Bearer ${c.env.SUPABASE_KEY}`,
+        'Prefer': 'return=minimal'
+      },
+      body: JSON.stringify({
+        person_id: personId,
+        email_id: emailId,
+        ip: c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for'),
+        user_agent: c.req.header('user-agent')
+      })
+    })
+  );
 
-  // Return the invisible pixel
-  res.set('Content-Type', 'image/gif');
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-  res.send(PIXEL);
+  // Return pixel
+  const binary = Uint8Array.from(atob(PIXEL), c => c.charCodeAt(0));
+  return new Response(binary, {
+    headers: {
+      'Content-Type': 'image/gif',
+      'Cache-Control': 'no-store, no-cache, must-revalidate'
+    }
+  });
 });
 
-// Health check (Render needs this)
-app.get('/', (req, res) => res.send('Tracker running'));
+app.get('/', (c) => c.text('Tracker running'));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+export default app;
