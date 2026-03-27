@@ -44,7 +44,7 @@ email-tracker/
 ├── index.js          # Main worker code (tracking logic)
 ├── wrangler.toml     # Cloudflare Workers config
 ├── package.json      # Dependencies
-└── .env              # Local only — never committed
+└── .dev.vars         # Local only — never committed
 ```
 
 ---
@@ -97,17 +97,55 @@ create table open_details (
 alter table opens enable row level security;
 alter table open_details enable row level security;
 
--- Allow server to write logs
-create policy "allow insert" on opens
-  for insert with check (true);
-create policy "allow insert" on open_details
-  for insert with check (true);
+-- Drop any old policies first (safe to run even if they don't exist)
+drop policy if exists "allow insert" on opens;
+drop policy if exists "allow insert" on open_details;
+drop policy if exists "block reads" on opens;
+drop policy if exists "block reads" on open_details;
 
--- Block all reads from outside
-create policy "block reads" on opens
-  for select using (false);
-create policy "block reads" on open_details
-  for select using (false);
+-- Allow INSERT for anon/authenticated (worker uses service role which bypasses RLS anyway)
+create policy "Allow INSERT" on opens
+  for insert
+  to authenticated, anon
+  with check (true);
+
+create policy "Allow INSERT" on open_details
+  for insert
+  to authenticated, anon
+  with check (true);
+
+-- Block all SELECTs from outside
+create policy "Block SELECT" on opens
+  for select
+  to authenticated, anon
+  using (false);
+
+create policy "Block SELECT" on open_details
+  for select
+  to authenticated, anon
+  using (false);
+
+-- Block UPDATE
+create policy "Block UPDATE" on opens
+  for update
+  to authenticated, anon
+  using (false);
+
+create policy "Block UPDATE" on open_details
+  for update
+  to authenticated, anon
+  using (false);
+
+-- Block DELETE
+create policy "Block DELETE" on opens
+  for delete
+  to authenticated, anon
+  using (false);
+
+create policy "Block DELETE" on open_details
+  for delete
+  to authenticated, anon
+  using (false);
 ```
 
 ---
@@ -118,7 +156,6 @@ create policy "block reads" on open_details
 
 ```javascript
 import { Hono } from 'hono';
-
 const app = new Hono();
 
 const PIXEL = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
@@ -146,10 +183,22 @@ app.get('/track/:personId/:emailId', async (c) => {
       })
     });
 
-    const [open] = await openRes.json();
+    const openText = await openRes.text();
+    console.log('STATUS:', openRes.status);
+    console.log('BODY:', openText);
+
+    if (!openRes.ok) return;
+
+    const openData = JSON.parse(openText);
+    const open = Array.isArray(openData) ? openData[0] : openData;
+
+    if (!open?.id) {
+      console.error('No id in response:', openText);
+      return;
+    }
 
     // 2. Insert enriched details referencing opens.id
-    await fetch(`${c.env.SUPABASE_URL}/rest/v1/open_details`, {
+    const detailRes = await fetch(`${c.env.SUPABASE_URL}/rest/v1/open_details`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -176,6 +225,10 @@ app.get('/track/:personId/:emailId', async (c) => {
         referer:         c.req.header('referer')          || null,
       })
     });
+
+    console.log('open_details status:', detailRes.status);
+    if (!detailRes.ok) console.error('open_details error:', await detailRes.text());
+
   })());
 
   const binary = Uint8Array.from(atob(PIXEL), c => c.charCodeAt(0));
@@ -198,6 +251,13 @@ export default app;
 name = "email-tracker"
 main = "index.js"
 compatibility_date = "2024-01-01"
+```
+
+### `.dev.vars` (local only — never commit this)
+
+```
+SUPABASE_URL = "https://xxxx.supabase.co"
+SUPABASE_KEY = "eyJ..."   # service_role key from Supabase → Settings → API
 ```
 
 ---
@@ -246,7 +306,6 @@ compatibility_date = "2024-01-01"
 ```bash
 git clone https://github.com/YOURNAME/email-tracker.git
 cd email-tracker
-git checkout cloudflare-workers
 npm install
 ```
 
@@ -256,7 +315,7 @@ npm install
 2. Run the SQL above in the SQL Editor
 3. Go to **Settings → API** and copy:
    - `Project URL`
-   - `anon public key`
+   - `service_role` key (labeled "secret" — the `eyJ...` JWT, not the `sb_publishable_...` one)
 
 ### 4. Login to Cloudflare
 
@@ -271,7 +330,7 @@ npx wrangler secret put SUPABASE_URL
 # paste your https://xxxx.supabase.co
 
 npx wrangler secret put SUPABASE_KEY
-# paste your eyJ... anon key
+# paste your service_role eyJ... key
 ```
 
 ### 6. Deploy
@@ -308,6 +367,24 @@ Every open logs a new row — so you can see open count and timestamps:
 
 ---
 
+## Verifying your security
+
+### Check RLS is on
+Supabase dashboard → **Table Editor** → `opens` table → confirm it shows **"RLS enabled"**. Do the same for `open_details`.
+
+### Test that reads are blocked
+Run this with your anon key — you should get back an empty array `[]`, never your actual rows:
+
+```bash
+curl https://YOUR_PROJECT.supabase.co/rest/v1/opens \
+  -H "apikey: YOUR_ANON_KEY" \
+  -H "Authorization: Bearer YOUR_ANON_KEY"
+```
+
+If you get real rows back, your SELECT policy is misconfigured.
+
+---
+
 ## Limitations
 
 | Issue | Detail |
@@ -321,7 +398,9 @@ Every open logs a new row — so you can see open count and timestamps:
 
 ## Security
 
-- ✅ Secrets stored in Cloudflare dashboard — never in code or repo
+- ✅ Uses `service_role` key — bypasses RLS safely from server-side only
+- ✅ Key stored in Cloudflare secrets — never in code or repo
+- ✅ `.dev.vars` is gitignored — never committed
 - ✅ All traffic over HTTPS
-- ✅ Supabase RLS enabled — data not readable via API
+- ✅ Supabase RLS enabled — data not readable via anon API
 - ✅ Server → server requests only — recipient never sees your keys
