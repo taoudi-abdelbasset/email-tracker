@@ -16,9 +16,10 @@ sequenceDiagram
     participant DB as Supabase (Database)
 
     You->>Email: Send email with hidden <img> tag
-    Note over Email: <img src="https://email-tracker.taoudiabdelbasset.workers.dev/track/john/invoice-march">
+    Note over Email: <img src="https://email-tracker.SUBDOMAINNAME.workers.dev/track/john/invoice-march">
     Email->>CF: GET /track/john/invoice-march (on open)
-    CF->>DB: INSERT { person_id, email_id, ip, user_agent, opened_at }
+    CF->>DB: INSERT into opens { person_id, email_id, ip, user_agent, opened_at }
+    CF->>DB: INSERT into open_details { open_id, geo, device, network... }
     CF-->>Email: Returns 1x1 transparent GIF
     Note over You: Row appears in Supabase → email was opened!
 ```
@@ -48,6 +49,69 @@ email-tracker/
 
 ---
 
+## Database schema (Supabase)
+
+Two tables: `opens` holds the core event, `open_details` holds all enriched metadata and references `opens` via foreign key. This separation lets you add or remove detail fields without touching the core opens table.
+
+Run this SQL in your Supabase SQL Editor:
+
+```sql
+-- Core open event
+create table opens (
+  id bigint generated always as identity primary key,
+  person_id text not null,
+  email_id text not null,
+  opened_at timestamptz default now(),
+  ip text,
+  user_agent text
+);
+
+-- Enriched metadata (references opens)
+create table open_details (
+  id uuid primary key default gen_random_uuid(),
+  open_id int8 not null references opens(id) on delete cascade,
+
+  -- network
+  ip_forwarded    text,
+  country_code    text,
+
+  -- cloudflare geo (free, no external API needed)
+  cf_country      text,
+  cf_city         text,
+  cf_region       text,
+  cf_latitude     text,
+  cf_longitude    text,
+  cf_timezone     text,
+  cf_asn          integer,
+  cf_org          text,
+  cf_postal       text,
+  cf_metro        text,
+  cf_is_eu        boolean,
+
+  -- device
+  accept_language text,
+  referer         text
+);
+
+-- Enable Row Level Security
+alter table opens enable row level security;
+alter table open_details enable row level security;
+
+-- Allow server to write logs
+create policy "allow insert" on opens
+  for insert with check (true);
+create policy "allow insert" on open_details
+  for insert with check (true);
+
+-- Block all reads from outside
+create policy "block reads" on opens
+  for select using (false);
+create policy "block reads" on open_details
+  for select using (false);
+```
+
+---
+
 ## Code explained
 
 ### `index.js`
@@ -57,41 +121,68 @@ import { Hono } from 'hono';
 
 const app = new Hono();
 
-// The 1x1 transparent GIF encoded in base64
 const PIXEL = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
-// Core tracking route — fires every time the email is opened
 app.get('/track/:personId/:emailId', async (c) => {
-  const personId = c.req.param('personId'); // who received the email e.g. "john"
-  const emailId = c.req.param('emailId');   // which email e.g. "invoice-march"
+  const personId = c.req.param('personId');
+  const emailId  = c.req.param('emailId');
+  const cf       = c.req.raw.cf || {};
 
-  // Log to Supabase in the background
-  // waitUntil = don't wait for this to finish before sending the pixel back
-  // This makes the response instant for the recipient
-  c.executionCtx.waitUntil(
-    fetch(`${c.env.SUPABASE_URL}/rest/v1/opens`, {
+  c.executionCtx.waitUntil((async () => {
+    // 1. Insert core open event, get back the new row id
+    const openRes = await fetch(`${c.env.SUPABASE_URL}/rest/v1/opens`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'apikey': c.env.SUPABASE_KEY,           // stored in Cloudflare secrets
+        'apikey':        c.env.SUPABASE_KEY,
         'Authorization': `Bearer ${c.env.SUPABASE_KEY}`,
-        'Prefer': 'return=minimal'
+        'Prefer':        'return=representation'
       },
       body: JSON.stringify({
-        person_id: personId,
-        email_id: emailId,
-        ip: c.req.header('cf-connecting-ip'),   // real IP via Cloudflare header
-        user_agent: c.req.header('user-agent')  // device/browser info
+        person_id:  personId,
+        email_id:   emailId,
+        ip:         c.req.header('cf-connecting-ip'),
+        user_agent: c.req.header('user-agent') || null,
       })
-    })
-  );
+    });
 
-  // Decode and return the invisible pixel immediately
+    const [open] = await openRes.json();
+
+    // 2. Insert enriched details referencing opens.id
+    await fetch(`${c.env.SUPABASE_URL}/rest/v1/open_details`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey':        c.env.SUPABASE_KEY,
+        'Authorization': `Bearer ${c.env.SUPABASE_KEY}`,
+        'Prefer':        'return=minimal'
+      },
+      body: JSON.stringify({
+        open_id:         open.id,
+        ip_forwarded:    (c.req.header('x-forwarded-for') || '').split(',')[0].trim() || null,
+        country_code:    c.req.header('cf-ipcountry') || null,
+        cf_country:      cf.country          || null,
+        cf_city:         cf.city             || null,
+        cf_region:       cf.region           || null,
+        cf_latitude:     cf.latitude         ? String(cf.latitude)  : null,
+        cf_longitude:    cf.longitude        ? String(cf.longitude) : null,
+        cf_timezone:     cf.timezone         || null,
+        cf_asn:          cf.asn              || null,
+        cf_org:          cf.asOrganization   || null,
+        cf_postal:       cf.postalCode       || null,
+        cf_metro:        cf.metroCode        || null,
+        cf_is_eu:        cf.isEUCountry === '1' ? true : false,
+        accept_language: c.req.header('accept-language') || null,
+        referer:         c.req.header('referer')          || null,
+      })
+    });
+  })());
+
   const binary = Uint8Array.from(atob(PIXEL), c => c.charCodeAt(0));
   return new Response(binary, {
     headers: {
-      'Content-Type': 'image/gif',
-      'Cache-Control': 'no-store, no-cache, must-revalidate' // prevent caching — critical!
+      'Content-Type':  'image/gif',
+      'Cache-Control': 'no-store, no-cache, must-revalidate'
     }
   });
 });
@@ -104,38 +195,41 @@ export default app;
 ### `wrangler.toml`
 
 ```toml
-name = "email-tracker"         # Worker name on Cloudflare
-main = "index.js"              # Entry point
+name = "email-tracker"
+main = "index.js"
 compatibility_date = "2024-01-01"
 ```
 
 ---
 
-## Database schema (Supabase)
+## What gets logged per open
 
-Run this SQL in your Supabase SQL Editor:
+### `opens` table
+| Field | Source | Example |
+|---|---|---|
+| `person_id` | URL param | `john` |
+| `email_id` | URL param | `invoice-march` |
+| `opened_at` | Supabase default | `2026-03-26 14:32 UTC` |
+| `ip` | `cf-connecting-ip` header | `66.249.93.171` or IPv6 |
+| `user_agent` | `user-agent` header | `Mozilla/5.0 ...` |
 
-```sql
-create table opens (
-  id bigint generated always as identity primary key,
-  person_id text not null,
-  email_id text not null,
-  opened_at timestamptz default now(),
-  ip text,
-  user_agent text
-);
+### `open_details` table (linked via `open_id`)
+| Field | Source | Example |
+|---|---|---|
+| `ip_forwarded` | `x-forwarded-for` | `142.250.x.x` |
+| `country_code` | `cf-ipcountry` header | `US` |
+| `cf_city` | CF request object | `New York` |
+| `cf_region` | CF request object | `New York` |
+| `cf_timezone` | CF request object | `America/New_York` |
+| `cf_org` | CF request object | `Comcast Cable` |
+| `cf_asn` | CF request object | `7922` |
+| `cf_latitude/longitude` | CF request object | `40.71 / -74.00` |
+| `cf_postal` | CF request object | `10001` |
+| `cf_is_eu` | CF request object | `false` |
+| `accept_language` | header | `en-US,en;q=0.9` |
+| `referer` | header | `https://mail.google.com/...` |
 
--- Enable Row Level Security
-alter table opens enable row level security;
-
--- Allow server to write logs
-create policy "allow insert" on opens
-  for insert with check (true);
-
--- Block all reads from outside
-create policy "block reads" on opens
-  for select using (false);
-```
+> **Note on IPv6**: If the IP looks like `XXX2:XXX7::` — that's normal IPv6, not a MAC address. Cloudflare will give you whichever version the client connects with.
 
 ---
 
@@ -173,17 +267,17 @@ npx wrangler login
 ### 5. Add your secrets
 
 ```bash
-wrangler secret put SUPABASE_URL
+npx wrangler secret put SUPABASE_URL
 # paste your https://xxxx.supabase.co
 
-wrangler secret put SUPABASE_KEY
+npx wrangler secret put SUPABASE_KEY
 # paste your eyJ... anon key
 ```
 
 ### 6. Deploy
 
 ```bash
-npm run deploy
+npx wrangler deploy
 ```
 
 Your worker is live at:
@@ -202,18 +296,6 @@ https://email-tracker.YOUR_SUBDOMAIN.workers.dev
      width="1" height="1" style="display:none;" />
 ```
 
-**Example — tracking John's March invoice:**
-```html
-<img src="https://email-tracker.taoudiabdelbasset.workers.dev/track/john/invoice-march"
-     width="1" height="1" style="display:none;" />
-```
-
-When John opens the email → a row appears in your Supabase `opens` table:
-
-| person_id | email_id | opened_at | ip |
-|---|---|---|---|
-| john | invoice-march | 2024-03-26 14:32 UTC | 142.250.x.x |
-
 ### Multiple opens
 
 Every open logs a new row — so you can see open count and timestamps:
@@ -230,9 +312,9 @@ Every open logs a new row — so you can see open count and timestamps:
 
 | Issue | Detail |
 |---|---|
-| Gmail/Apple Mail proxy images | IP will be Google's server, not the real user. Open event still fires. |
-| Pre-fetching | Some clients fetch images before user opens. Rare. |
-| Forwards | Forwarded emails log under original recipient's ID |
+| Gmail/Apple Mail proxy images | IP will be Google's or Apple's server, not the real user. Open event still fires. |
+| Pre-fetching | Some clients fetch images before the user opens. Rare. |
+| Forwards | Forwarded emails log under the original recipient's ID |
 | Image blocking | Users with images disabled won't trigger the tracker |
 
 ---
