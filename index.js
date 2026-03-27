@@ -8,7 +8,6 @@ app.get('/track/:personId/:emailId', async (c) => {
   const cf       = c.req.raw.cf || {};
 
   c.executionCtx.waitUntil((async () => {
-    // 1. Insert into opens, get back the id
     const openRes = await fetch(`${c.env.SUPABASE_URL}/rest/v1/opens`, {
       method: 'POST',
       headers: {
@@ -25,10 +24,21 @@ app.get('/track/:personId/:emailId', async (c) => {
       })
     });
 
-    const [open] = await openRes.json();  // grab the inserted row
+    const openText = await openRes.text();
+    console.log('STATUS:', openRes.status);
+    console.log('BODY:', openText);
 
-    // 2. Insert details referencing opens.id
-    await fetch(`${c.env.SUPABASE_URL}/rest/v1/open_details`, {
+    if (!openRes.ok) return;
+
+    const openData = JSON.parse(openText);
+    const open = Array.isArray(openData) ? openData[0] : openData;
+
+    if (!open?.id) {
+      console.error('No id in response:', openText);
+      return;
+    }
+
+    const detailRes = await fetch(`${c.env.SUPABASE_URL}/rest/v1/open_details`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -55,6 +65,10 @@ app.get('/track/:personId/:emailId', async (c) => {
         referer:         c.req.header('referer')          || null,
       })
     });
+
+    console.log('open_details status:', detailRes.status);
+    if (!detailRes.ok) console.error('open_details error:', await detailRes.text());
+
   })());
 
   const binary = Uint8Array.from(atob(PIXEL), c => c.charCodeAt(0));
